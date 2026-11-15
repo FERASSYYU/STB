@@ -26,7 +26,6 @@ jobs:
       OLLAMA_MODEL: "qwen3.5:9b"
       OPENCODE_VERSION: "1.19.5"
       GODOT_VERSION: "4.6.3"
-      TEST_DIR: ${{ runner.temp }}/opencode-godot-smoke-test
 
     steps:
       - name: Record runner resources
@@ -40,6 +39,7 @@ jobs:
           free -h | tee -a "$GITHUB_STEP_SUMMARY"
           df -h "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
           date +%s > "$RUNNER_TEMP/smoke-test-start-epoch"
+          echo "TEST_DIR=$RUNNER_TEMP/opencode-godot-smoke-test" >> "$GITHUB_ENV"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           command -v curl
           command -v unzip
