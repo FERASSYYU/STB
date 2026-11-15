@@ -1,0 +1,298 @@
+name: Ollama + OpenCode smoke test
+run-name: "Ollama smoke test #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+
+# No repository write access is needed. This test runs in a temporary directory
+# and does not check out, modify, commit, or push repository files.
+permissions: {}
+
+concurrency:
+  group: ollama-opencode-smoke-test
+  cancel-in-progress: false
+
+jobs:
+  smoke-test:
+    name: Test local model, coding agent, and Godot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: {}
+    env:
+      OLLAMA_CONTEXT_LENGTH: "65536"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_MODEL: "qwen3.5:9b"
+      OPENCODE_VERSION: "1.19.5"
+      GODOT_VERSION: "4.6.3"
+      TEST_DIR: ${{ runner.temp }}/opencode-godot-smoke-test
+
+    steps:
+      - name: Record runner resources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          uname -a | tee -a "$GITHUB_STEP_SUMMARY"
+          nproc | tee -a "$GITHUB_STEP_SUMMARY"
+          free -h | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
+          date +%s > "$RUNNER_TEMP/smoke-test-start-epoch"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          command -v curl
+          command -v unzip
+          command -v git
+          command -v node
+          command -v npm
+          node --version
+          npm --version
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl --fail --location --retry 3 --retry-delay 2 \
+            https://ollama.com/install.sh \
+            --output "$RUNNER_TEMP/ollama-install.sh"
+          sudo sh "$RUNNER_TEMP/ollama-install.sh"
+          ollama --version
+
+      - name: Start Ollama with agent context settings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Stop the installer-created service if it was started. Run our own
+          # process so the required context and concurrency settings are applied.
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl stop ollama.service 2>/dev/null || true
+          fi
+
+          nohup env \
+            OLLAMA_HOST=127.0.0.1:11434 \
+            OLLAMA_CONTEXT_LENGTH="$OLLAMA_CONTEXT_LENGTH" \
+            OLLAMA_NUM_PARALLEL="$OLLAMA_NUM_PARALLEL" \
+            OLLAMA_MAX_LOADED_MODELS="$OLLAMA_MAX_LOADED_MODELS" \
+            OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE" \
+            ollama serve \
+            > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/ollama.pid"
+
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:11434/api/version >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$ready" != "1" ]]; then
+            echo "Ollama did not become ready. Recent server log:" >&2
+            tail -n 100 "$RUNNER_TEMP/ollama.log" >&2 || true
+            exit 1
+          fi
+
+          curl --fail --silent http://127.0.0.1:11434/api/version
+
+      - name: Download the Qwen model
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "## Model download" >> "$GITHUB_STEP_SUMMARY"
+          echo "Model: \`$OLLAMA_MODEL\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Context: \`$OLLAMA_CONTEXT_LENGTH\` tokens" >> "$GITHUB_STEP_SUMMARY"
+          timeout --signal=TERM --kill-after=30s 45m ollama pull "$OLLAMA_MODEL"
+          ollama show "$OLLAMA_MODEL"
+          ollama list
+          free -h
+          df -h "$RUNNER_TEMP"
+
+      - name: Install OpenCode CLI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --global "opencode-ai@${OPENCODE_VERSION}"
+          opencode --version
+
+      - name: Create isolated GDScript test project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/tests"
+          cd "$TEST_DIR"
+
+          cat > project.godot <<'GODOT'
+          ; Engine configuration file.
+          ; This is a disposable smoke-test project created by GitHub Actions.
+
+          config_version=5
+
+          [application]
+          config/name="OpenCode Agent Smoke Test"
+
+          [rendering]
+          renderer/rendering_method="gl_compatibility"
+          renderer/rendering_method.mobile="gl_compatibility"
+          GODOT
+
+          cat > scripts/income_calculator.gd <<'GDSCRIPT'
+          extends RefCounted
+
+          # The agent must implement this function without changing its signature.
+          static func calculate_income(base_income: int, multiplier: float) -> int:
+              # TODO: Return the mathematical floor of base_income * multiplier.
+              return 0
+          GDSCRIPT
+
+          cat > tests/smoke_test.gd <<'GDSCRIPT'
+          extends SceneTree
+
+          const IncomeCalculator = preload("res://scripts/income_calculator.gd")
+
+          func _initialize() -> void:
+              var cases: Array[Dictionary] = [
+                  {"base": 100, "multiplier": 1.5, "expected": 150},
+                  {"base": 99, "multiplier": 0.5, "expected": 49},
+                  {"base": 0, "multiplier": 3.0, "expected": 0},
+                  {"base": -3, "multiplier": 0.5, "expected": -2},
+              ]
+
+              for test_case: Dictionary in cases:
+                  var actual: int = IncomeCalculator.calculate_income(
+                      int(test_case["base"]),
+                      float(test_case["multiplier"])
+                  )
+                  if actual != int(test_case["expected"]):
+                      push_error(
+                          "FAIL: base=%s multiplier=%s expected=%s got=%s" % [
+                              test_case["base"],
+                              test_case["multiplier"],
+                              test_case["expected"],
+                              actual
+                          ]
+                      )
+                      quit(1)
+                      return
+
+              print("PASS: all income calculator cases")
+              quit(0)
+          GDSCRIPT
+
+          cat > AGENTS.md <<'AGENTS'
+          # Smoke-test agent instructions
+
+          You are testing whether the local Ollama model can make one small GDScript edit.
+          - Read the existing script before editing it.
+          - Edit ONLY `scripts/income_calculator.gd`.
+          - Preserve the function name, parameters, and return type.
+          - Implement mathematical floor of `base_income * multiplier`, returned as int.
+          - Do not truncate toward zero: for example, floor(-1.5) must be -2.
+          - Do not create, delete, or modify any other file.
+          - Do not use shell commands, network access, web search, or subagents.
+          - Do not change the test or project files.
+          AGENTS
+
+          cat > opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "model": "ollama/qwen3.5:9b",
+            "small_model": "ollama/qwen3.5:9b",
+            "permissions": [
+              { "action": "*", "resource": "*", "effect": "deny" },
+              { "action": "read", "resource": "*", "effect": "allow" },
+              { "action": "glob", "resource": "*", "effect": "allow" },
+              { "action": "grep", "resource": "*", "effect": "allow" },
+              { "action": "edit", "resource": "scripts/income_calculator.gd", "effect": "allow" },
+              { "action": "shell", "resource": "*", "effect": "deny" },
+              { "action": "webfetch", "resource": "*", "effect": "deny" },
+              { "action": "websearch", "resource": "*", "effect": "deny" },
+              { "action": "subagent", "resource": "*", "effect": "deny" },
+              { "action": "question", "resource": "*", "effect": "deny" }
+            ]
+          }
+          JSON
+
+          git init --quiet
+          git config user.name "GitHub Actions Smoke Test"
+          git config user.email "actions-smoke-test@users.noreply.github.com"
+          git add project.godot scripts tests AGENTS.md opencode.json
+          git commit --quiet -m "Create baseline smoke test"
+          echo "Disposable project created at: $TEST_DIR"
+
+      - name: Run OpenCode against the local Ollama model
+        shell: bash
+        working-directory: ${{ runner.temp }}/opencode-godot-smoke-test
+        run: |
+          set -Eeuo pipefail
+          timeout --signal=TERM --kill-after=30s 45m \
+            opencode run \
+              --agent build \
+              --model "ollama/${OLLAMA_MODEL}" \
+              "Read AGENTS.md. Implement the requested function in scripts/income_calculator.gd. Use only the allowed file tools. Do not run commands and do not touch any other file. Then briefly state what you changed."
+
+          echo "## Agent edit" >> "$GITHUB_STEP_SUMMARY"
+          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+          git diff -- scripts/income_calculator.gd >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          if git diff --quiet -- scripts/income_calculator.gd; then
+            echo "OpenCode did not modify the target GDScript file." >&2
+            exit 1
+          fi
+
+          unexpected_files="$(git diff --name-only | grep -v '^scripts/income_calculator\.gd$' || true)"
+          if [[ -n "$unexpected_files" ]]; then
+            echo "Unexpected modified files detected:" >&2
+            printf '%s\n' "$unexpected_files" >&2
+            exit 1
+          fi
+
+          git diff --check
+
+      - name: Install the pinned Godot editor
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          GODOT_ARCHIVE="$RUNNER_TEMP/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          GODOT_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "$GODOT_URL" --output "$GODOT_ARCHIVE"
+          mkdir -p "$RUNNER_TEMP/godot"
+          unzip -q "$GODOT_ARCHIVE" -d "$RUNNER_TEMP/godot"
+          GODOT_BIN="$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64"
+          test -x "$GODOT_BIN" || chmod +x "$GODOT_BIN"
+          "$GODOT_BIN" --version
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+
+      - name: Validate the agent's GDScript edit with Godot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$GODOT_BIN" --headless --path "$TEST_DIR" --editor --quit
+          "$GODOT_BIN" --headless --path "$TEST_DIR" --script res://tests/smoke_test.gd
+
+      - name: Record final resource usage
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "## Final resource snapshot" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RUNNER_TEMP/smoke-test-start-epoch" ]]; then
+            started="$(cat "$RUNNER_TEMP/smoke-test-start-epoch")"
+            elapsed="$(( $(date +%s) - started ))"
+            echo "Elapsed time: ${elapsed}s" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          free -h | tee -a "$GITHUB_STEP_SUMMARY" || true
+          df -h "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          ollama ps 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RUNNER_TEMP/ollama.log" ]]; then
+            echo "### Ollama log tail" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 60 "$RUNNER_TEMP/ollama.log" | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
