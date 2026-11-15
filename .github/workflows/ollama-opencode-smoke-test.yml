@@ -1,120 +1,247 @@
-name: Ollama + OpenCode smoke test
-run-name: "Ollama smoke test #${{ github.run_number }}"
+name: Local CPU coding agent (llama.cpp + OpenCode)
+run-name: "Local agent test #${{ github.run_number }}"
 
+# Manual trigger only, to avoid repeated expensive runs.
 on:
   workflow_dispatch:
 
-# No repository write access is needed. This test runs in a temporary directory
-# and does not check out, modify, commit, or push repository files.
+# Least privilege: the job needs no repository token. It never pushes.
 permissions: {}
 
 concurrency:
-  group: ollama-opencode-smoke-test
+  group: local-cpu-agent
   cancel-in-progress: false
 
+env:
+  # Pinned llama.cpp build tag (CPU-only build). Newest numbered tag checked: b12422.
+  LLAMA_TAG: "b12422"
+  # Official llama.cpp-org GGUF conversion of Gemma 4 E4B IT.
+  MODEL_REPO: "ggml-org/gemma-4-e4b-it-GGUF"
+  MODEL_ALIAS: "gemma-4-e4b-it"
+  MODEL_QUANT_PATTERN: "Q4_K_M"
+  # Conservative context for a 4-vCPU / 16 GB runner.
+  CTX_SIZE: "8192"
+  SERVER_PORT: "8080"
+  OPENCODE_VERSION: "1.19.5"
+  GODOT_VERSION: "4.6.3"
+
 jobs:
-  smoke-test:
-    name: Test local model, coding agent, and Godot
+  agent:
+    name: Build llama.cpp, serve Gemma, run OpenCode, validate Godot
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     permissions: {}
-    env:
-      OLLAMA_CONTEXT_LENGTH: "65536"
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      OLLAMA_KEEP_ALIVE: "5m"
-      OLLAMA_MODEL: "qwen3.5:9b"
-      OPENCODE_VERSION: "1.19.5"
-      GODOT_VERSION: "4.6.3"
 
     steps:
       - name: Record runner resources
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "## Runner" >> "$GITHUB_STEP_SUMMARY"
-          echo '```text' >> "$GITHUB_STEP_SUMMARY"
-          uname -a | tee -a "$GITHUB_STEP_SUMMARY"
-          nproc | tee -a "$GITHUB_STEP_SUMMARY"
-          free -h | tee -a "$GITHUB_STEP_SUMMARY"
-          df -h "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
-          date +%s > "$RUNNER_TEMP/smoke-test-start-epoch"
-          echo "TEST_DIR=$RUNNER_TEMP/opencode-godot-smoke-test" >> "$GITHUB_ENV"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          command -v curl
-          command -v unzip
-          command -v git
-          command -v node
-          command -v npm
-          node --version
-          npm --version
+          echo "START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          {
+            echo "## Runner"
+            echo '```text'
+            echo "CPU model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs || echo unknown)"
+            echo "Cores: $(nproc)"
+            free -h
+            df -h "$RUNNER_TEMP"
+            echo "GPU devices: $(ls /dev/nvidia* /dev/dri 2>/dev/null | wc -l) (expected 0)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "CORES=$(nproc)" >> "$GITHUB_ENV"
 
-      - name: Install Ollama
+      # Only the llama.cpp install directory is cached. It contains no secrets.
+      - name: Restore llama.cpp build cache
+        id: llama-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/llama-install
+          key: llama-cpu-${{ env.LLAMA_TAG }}-ubuntu24-v1
+
+      - name: Build llama.cpp (CPU-only)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
-          curl --fail --location --retry 3 --retry-delay 2 \
-            https://ollama.com/install.sh \
-            --output "$RUNNER_TEMP/ollama-install.sh"
-          sudo sh "$RUNNER_TEMP/ollama-install.sh"
-          ollama --version
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake build-essential
+          git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama.cpp/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_VULKAN=OFF \
+            -DGGML_METAL=OFF \
+            -DLLAMA_CURL=OFF
+          cmake --build "$RUNNER_TEMP/llama.cpp/build" --config Release -j "$CORES" --target llama-server
+          mkdir -p "$RUNNER_TEMP/llama-install/bin"
+          cp "$RUNNER_TEMP/llama.cpp/build/bin/llama-server" "$RUNNER_TEMP/llama-install/bin/"
 
-      - name: Start Ollama with agent context settings
+      - name: Verify CPU-only llama.cpp binary (Test A, build level)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Stop the installer-created service if it was started. Run our own
-          # process so the required context and concurrency settings are applied.
-          if command -v systemctl >/dev/null 2>&1; then
-            sudo systemctl stop ollama.service 2>/dev/null || true
-          fi
-
-          nohup env \
-            OLLAMA_HOST=127.0.0.1:11434 \
-            OLLAMA_CONTEXT_LENGTH="$OLLAMA_CONTEXT_LENGTH" \
-            OLLAMA_NUM_PARALLEL="$OLLAMA_NUM_PARALLEL" \
-            OLLAMA_MAX_LOADED_MODELS="$OLLAMA_MAX_LOADED_MODELS" \
-            OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE" \
-            ollama serve \
-            > "$RUNNER_TEMP/ollama.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/ollama.pid"
-
-          ready=0
-          for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:11434/api/version >/dev/null; then
-              ready=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [[ "$ready" != "1" ]]; then
-            echo "Ollama did not become ready. Recent server log:" >&2
-            tail -n 100 "$RUNNER_TEMP/ollama.log" >&2 || true
+          bin="$RUNNER_TEMP/llama-install/bin/llama-server"
+          test -x "$bin"
+          if ldd "$bin" | grep -Eiq 'cuda|vulkan|nvidia|metal|rocm|hip'; then
+            echo "GPU backend library linked into the CPU-only binary." >&2
             exit 1
           fi
+          "$bin" --version 2>&1 | tail -n 3
+          echo "LLAMA_SERVER=$bin" >> "$GITHUB_ENV"
 
-          curl --fail --silent http://127.0.0.1:11434/api/version
-
-      - name: Download the Qwen model
+      # Resolve the exact Q4_K_M file and its SHA-256 from the Hugging Face API.
+      - name: Resolve model file and expected SHA-256
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "## Model download" >> "$GITHUB_STEP_SUMMARY"
-          echo "Model: \`$OLLAMA_MODEL\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Context: \`$OLLAMA_CONTEXT_LENGTH\` tokens" >> "$GITHUB_STEP_SUMMARY"
-          timeout --signal=TERM --kill-after=30s 45m ollama pull "$OLLAMA_MODEL"
-          ollama show "$OLLAMA_MODEL"
-          ollama list
-          free -h
-          df -h "$RUNNER_TEMP"
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          repo = os.environ["MODEL_REPO"]
+          url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
+          with urllib.request.urlopen(url, timeout=60) as r:
+              entries = json.load(r)
+          quant = os.environ["MODEL_QUANT_PATTERN"].upper()
+          cands = [e for e in entries
+                   if e.get("type") == "file"
+                   and e["path"].lower().endswith(".gguf")
+                   and quant in e["path"].upper()
+                   and "mmproj" not in e["path"].lower()]
+          if len(cands) != 1:
+              print("Expected exactly one matching GGUF, found:", [c["path"] for c in cands], file=sys.stderr)
+              sys.exit(1)
+          e = cands[0]
+          lfs = e.get("lfs") or {}
+          if not lfs.get("oid") or not lfs.get("size"):
+              print("No LFS SHA-256/size metadata for", e["path"], file=sys.stderr)
+              sys.exit(1)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"MODEL_FILE={e['path']}\n")
+              env.write(f"MODEL_SHA256={lfs['oid']}\n")
+              env.write(f"MODEL_SIZE_BYTES={lfs['size']}\n")
+          print("Resolved:", e["path"], "size:", lfs["size"], "sha256:", lfs["oid"])
+          PY
+          {
+            echo "## Model identity"
+            echo "- Repository: \`$MODEL_REPO\`"
+            echo "- File: \`$MODEL_FILE\`"
+            echo "- SHA-256: \`$MODEL_SHA256\`"
+            echo "- Size: $(( MODEL_SIZE_BYTES / 1024 / 1024 )) MiB"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install OpenCode CLI
+      - name: Restore model cache
+        id: model-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/models
+          key: gguf-${{ env.MODEL_REPO }}-${{ env.MODEL_FILE }}-v1
+
+      - name: Download and verify model (Test B)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # The hosted runner user cannot write to /usr/local/bin, so install
-          # into a user-owned npm prefix and add its bin directory to PATH.
+          mkdir -p "$RUNNER_TEMP/models"
+          model_path="$RUNNER_TEMP/models/$MODEL_FILE"
+          if [[ -f "$model_path" ]] && echo "$MODEL_SHA256  $model_path" | sha256sum -c --status -; then
+            echo "Cached model verified."
+          else
+            rm -f "$model_path"
+            start=$(date +%s)
+            curl --fail --location --retry 5 --retry-delay 5 \
+              "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE" \
+              --output "$model_path"
+            echo "Download seconds: $(( $(date +%s) - start ))"
+            echo "$MODEL_SHA256  $model_path" | sha256sum -c -
+          fi
+          echo "MODEL_PATH=$model_path" >> "$GITHUB_ENV"
+
+      - name: Start llama.cpp server (CPU, one request at a time)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          log="$RUNNER_TEMP/llama-server.log"
+          load_start=$(date +%s)
+          nohup "$LLAMA_SERVER" \
+            -m "$MODEL_PATH" \
+            --alias "$MODEL_ALIAS" \
+            --host 127.0.0.1 --port "$SERVER_PORT" \
+            -c "$CTX_SIZE" \
+            -t "$CORES" -tb "$CORES" \
+            -np 1 \
+            -ngl 0 \
+            --jinja \
+            > "$log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/llama-server.pid"
+          ready=0
+          for _ in $(seq 1 300); do
+            if curl --fail --silent "http://127.0.0.1:$SERVER_PORT/health" | grep -q '"ok"'; then
+              ready=1; break
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/llama-server.pid")" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [[ "$ready" != "1" ]]; then
+            echo "llama-server did not become healthy. Log tail:" >&2
+            tail -n 100 "$log" >&2 || true
+            exit 1
+          fi
+          echo "Model load + health seconds: $(( $(date +%s) - load_start ))"
+          # Test A (runtime): confirm the server reports CPU and no GPU backend.
+          if grep -Eiq 'CUDA|Vulkan|Metal|ROCm' "$log"; then
+            echo "GPU backend mentioned in server log:" >&2
+            grep -Ei 'CUDA|Vulkan|Metal|ROCm' "$log" >&2
+            exit 1
+          fi
+          grep -m1 -i 'system_info' "$log" || true
+
+      - name: Verify text inference and tool calling (Tests D and E)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.request
+          base = f"http://127.0.0.1:{os.environ['SERVER_PORT']}/v1/chat/completions"
+          alias = os.environ["MODEL_ALIAS"]
+
+          def post(payload):
+              req = urllib.request.Request(base, data=json.dumps(payload).encode(),
+                                           headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=900) as r:
+                  return json.load(r)
+
+          # Test D: plain text.
+          t0 = time.time()
+          d = post({"model": alias, "max_tokens": 32, "temperature": 0,
+                    "messages": [{"role": "user", "content": "Reply with the single word: pong"}]})
+          text = d["choices"][0]["message"].get("content") or ""
+          if "pong" not in text.lower():
+              print("Text inference returned unexpected content:", text, file=sys.stderr); sys.exit(1)
+          timings = d.get("timings", {})
+          print("Test D passed in %.1fs; predicted tok/s: %s" % (time.time() - t0, timings.get("predicted_per_second")))
+
+          # Test E: a real tool call must come back as structured tool_calls.
+          tool = {"type": "function", "function": {
+              "name": "record_marker",
+              "description": "Record a marker value.",
+              "parameters": {"type": "object",
+                             "properties": {"value": {"type": "string"}},
+                             "required": ["value"]}}}
+          d = post({"model": alias, "max_tokens": 128, "temperature": 0,
+                    "tools": [tool], "tool_choice": "required",
+                    "messages": [{"role": "user", "content": "Call record_marker with value ok."}]})
+          calls = d["choices"][0]["message"].get("tool_calls") or []
+          if not calls or calls[0]["function"]["name"] != "record_marker":
+              print("Test E failed: no structured tool call:", json.dumps(d)[:800], file=sys.stderr); sys.exit(1)
+          print("Test E passed: tool_call args =", calls[0]["function"]["arguments"])
+          PY
+          echo "## Model checks" >> "$GITHUB_STEP_SUMMARY"
+          echo "Text inference and structured tool calling passed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install OpenCode CLI (user-owned prefix)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           NPM_PREFIX="$RUNNER_TEMP/npm-global"
           npm install --global --prefix "$NPM_PREFIX" "opencode-ai@${OPENCODE_VERSION}"
           echo "$NPM_PREFIX/bin" >> "$GITHUB_PATH"
@@ -125,12 +252,14 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          TEST_DIR="$RUNNER_TEMP/opencode-godot-smoke-test"
+          echo "TEST_DIR=$TEST_DIR" >> "$GITHUB_ENV"
           mkdir -p "$TEST_DIR/scripts" "$TEST_DIR/tests"
           cd "$TEST_DIR"
 
           cat > project.godot <<'GODOT'
           ; Engine configuration file.
-          ; This is a disposable smoke-test project created by GitHub Actions.
+          ; This is a disposable test project created by GitHub Actions.
 
           config_version=5
 
@@ -188,7 +317,7 @@ jobs:
           cat > AGENTS.md <<'AGENTS'
           # Smoke-test agent instructions
 
-          You are testing whether the local Ollama model can make one small GDScript edit.
+          You are testing whether the local model can make one small GDScript edit.
           - Read the existing script before editing it.
           - Edit ONLY `scripts/income_calculator.gd`.
           - Preserve the function name, parameters, and return type.
@@ -202,14 +331,16 @@ jobs:
           cat > opencode.json <<'JSON'
           {
             "$schema": "https://opencode.ai/config.json",
-            "model": "ollama/qwen3.5:9b",
-            "small_model": "ollama/qwen3.5:9b",
+            "model": "llamacpp/gemma-4-e4b-it",
+            "small_model": "llamacpp/gemma-4-e4b-it",
             "provider": {
-              "ollama": {
+              "llamacpp": {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": "Ollama (local)",
-                "options": { "baseURL": "http://127.0.0.1:11434/v1" },
-                "models": { "qwen3.5:9b": { "name": "qwen3.5:9b" } }
+                "name": "llama.cpp (local CPU)",
+                "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+                "models": {
+                  "gemma-4-e4b-it": { "name": "Gemma 4 E4B (local)", "tool_call": true }
+                }
               }
             },
             "permission": {
@@ -240,34 +371,43 @@ jobs:
           git commit --quiet -m "Create baseline smoke test"
           echo "Disposable project created at: $TEST_DIR"
 
-      - name: Run OpenCode against the local Ollama model
+      - name: Run OpenCode against the local llama.cpp server (Tests F and G, agent part)
         shell: bash
-        working-directory: ${{ runner.temp }}/opencode-godot-smoke-test
+        working-directory: ${{ env.TEST_DIR }}
         run: |
           set -Eeuo pipefail
-          timeout --signal=TERM --kill-after=30s 45m \
+          export PATH="$RUNNER_TEMP/npm-global/bin:$PATH"
+          start=$(date +%s)
+          set +e
+          timeout --signal=TERM --kill-after=30s 25m \
             opencode run \
               --agent build \
-              --model "ollama/${OLLAMA_MODEL}" \
+              --model "llamacpp/${MODEL_ALIAS}" \
               "Read AGENTS.md. Implement the requested function in scripts/income_calculator.gd. Use only the allowed file tools. Do not run commands and do not touch any other file. Then briefly state what you changed."
-
-          echo "## Agent edit" >> "$GITHUB_STEP_SUMMARY"
-          echo '```diff' >> "$GITHUB_STEP_SUMMARY"
-          git diff -- scripts/income_calculator.gd >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
+          rc=$?
+          set -e
+          echo "OpenCode exit code: $rc after $(( $(date +%s) - start ))s"
+          {
+            echo "## Agent edit"
+            echo "OpenCode exit code: \`$rc\`, duration $(( $(date +%s) - start ))s"
+            echo '```diff'
+            git diff -- scripts/income_calculator.gd || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$rc" != "0" ]]; then
+            echo "OpenCode failed or timed out (exit $rc)." >&2
+            exit 1
+          fi
           if git diff --quiet -- scripts/income_calculator.gd; then
             echo "OpenCode did not modify the target GDScript file." >&2
             exit 1
           fi
-
           unexpected_files="$(git status --porcelain --untracked-files=all | awk '{print $2}' | grep -v '^scripts/income_calculator\.gd$' || true)"
           if [[ -n "$unexpected_files" ]]; then
             echo "Unexpected modified files detected:" >&2
             printf '%s\n' "$unexpected_files" >&2
             exit 1
           fi
-
           git diff --check
 
       - name: Install the pinned Godot editor
@@ -276,9 +416,7 @@ jobs:
           set -Eeuo pipefail
           GODOT_ARCHIVE="$RUNNER_TEMP/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
           GODOT_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
-
-          curl --fail --location --retry 3 --retry-delay 2 \
-            "$GODOT_URL" --output "$GODOT_ARCHIVE"
+          curl --fail --location --retry 3 --retry-delay 2 "$GODOT_URL" --output "$GODOT_ARCHIVE"
           mkdir -p "$RUNNER_TEMP/godot"
           unzip -q "$GODOT_ARCHIVE" -d "$RUNNER_TEMP/godot"
           GODOT_BIN="$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64"
@@ -286,32 +424,28 @@ jobs:
           "$GODOT_BIN" --version
           echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
-      - name: Validate the agent's GDScript edit with Godot
+      - name: Validate the agent's GDScript edit with Godot (Test I)
         shell: bash
         run: |
           set -Eeuo pipefail
           "$GODOT_BIN" --headless --path "$TEST_DIR" --editor --quit
           "$GODOT_BIN" --headless --path "$TEST_DIR" --script res://tests/smoke_test.gd
 
-      - name: Record final resource usage
+      - name: Stop server and record final resources (Test J)
         if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "## Final resource snapshot" >> "$GITHUB_STEP_SUMMARY"
-          if [[ -f "$RUNNER_TEMP/smoke-test-start-epoch" ]]; then
-            started="$(cat "$RUNNER_TEMP/smoke-test-start-epoch")"
-            elapsed="$(( $(date +%s) - started ))"
-            echo "Elapsed time: ${elapsed}s" | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-          echo '```text' >> "$GITHUB_STEP_SUMMARY"
-          free -h | tee -a "$GITHUB_STEP_SUMMARY" || true
-          df -h "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY" || true
-          ollama ps 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          if [[ -f "$RUNNER_TEMP/ollama.log" ]]; then
-            echo "### Ollama log tail" >> "$GITHUB_STEP_SUMMARY"
-            echo '```text' >> "$GITHUB_STEP_SUMMARY"
-            tail -n 60 "$RUNNER_TEMP/ollama.log" | tee -a "$GITHUB_STEP_SUMMARY" || true
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          pid_file="$RUNNER_TEMP/llama-server.pid"
+          {
+            echo "## Final resources"
+            echo '```text'
+            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+              echo "llama-server RSS: $(( $(ps -o rss= -p "$(cat "$pid_file")") / 1024 )) MiB"
+              kill "$(cat "$pid_file")" || true
+            fi
+            free -h
+            df -h "$RUNNER_TEMP"
+            echo "Elapsed: $(( $(date +%s) - START_EPOCH ))s"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
