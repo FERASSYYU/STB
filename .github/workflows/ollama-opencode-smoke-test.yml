@@ -239,6 +239,23 @@ jobs:
           with open(summary, "a") as s:
               s.write("- Test E (structured tool call): PASS\n")
           print("Test E passed:", calls[0]["function"]["arguments"])
+
+          # Test E2: the agent loop needs a final text answer after a tool result.
+          # Earlier runs stopped after the first tool call with no text.
+          call = dict(calls[0])
+          call_id = call.get("id") or "call_1"
+          call["id"] = call_id
+          d = post({"model": alias, "max_tokens": 128, "temperature": 0,
+                    "tools": [tool], "tool_choice": "auto",
+                    "messages": [
+                        {"role": "user", "content": "Call the record_marker tool with value ok, then tell me the result in one sentence."},
+                        {"role": "assistant", "content": None, "tool_calls": [call]},
+                        {"role": "tool", "tool_call_id": call_id, "content": "{\"status\": \"recorded\", \"value\": \"ok\"}"}]})
+          answer = (d["choices"][0]["message"].get("content") or "").strip()
+          if not answer:
+              print("Test E2 failed: no text answer after tool result. Raw:", json.dumps(d)[:800], file=sys.stderr); sys.exit(1)
+          with open(summary, "a") as s:
+              s.write(f"- Test E2 (tool result round trip): PASS, answer: {answer[:120]}\n")
           PY
 
       - name: Install OpenCode CLI (user-owned prefix)
