@@ -204,18 +204,32 @@ jobs:
             "$schema": "https://opencode.ai/config.json",
             "model": "ollama/qwen3.5:9b",
             "small_model": "ollama/qwen3.5:9b",
-            "permissions": [
-              { "action": "*", "resource": "*", "effect": "deny" },
-              { "action": "read", "resource": "*", "effect": "allow" },
-              { "action": "glob", "resource": "*", "effect": "allow" },
-              { "action": "grep", "resource": "*", "effect": "allow" },
-              { "action": "edit", "resource": "scripts/income_calculator.gd", "effect": "allow" },
-              { "action": "shell", "resource": "*", "effect": "deny" },
-              { "action": "webfetch", "resource": "*", "effect": "deny" },
-              { "action": "websearch", "resource": "*", "effect": "deny" },
-              { "action": "subagent", "resource": "*", "effect": "deny" },
-              { "action": "question", "resource": "*", "effect": "deny" }
-            ]
+            "provider": {
+              "ollama": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Ollama (local)",
+                "options": { "baseURL": "http://127.0.0.1:11434/v1" },
+                "models": { "qwen3.5:9b": { "name": "qwen3.5:9b" } }
+              }
+            },
+            "permission": {
+              "*": "deny",
+              "read": "allow",
+              "glob": "allow",
+              "grep": "allow",
+              "edit": {
+                "*": "deny",
+                "scripts/income_calculator.gd": "allow"
+              },
+              "bash": "deny",
+              "webfetch": "deny",
+              "websearch": "deny",
+              "task": "deny",
+              "skill": "deny",
+              "question": "deny",
+              "external_directory": "deny",
+              "doom_loop": "allow"
+            }
           }
           JSON
 
@@ -247,7 +261,7 @@ jobs:
             exit 1
           fi
 
-          unexpected_files="$(git diff --name-only | grep -v '^scripts/income_calculator\.gd$' || true)"
+          unexpected_files="$(git status --porcelain --untracked-files=all | awk '{print $2}' | grep -v '^scripts/income_calculator\.gd$' || true)"
           if [[ -n "$unexpected_files" ]]; then
             echo "Unexpected modified files detected:" >&2
             printf '%s\n' "$unexpected_files" >&2
