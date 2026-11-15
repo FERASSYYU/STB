@@ -113,7 +113,12 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          npm install --global "opencode-ai@${OPENCODE_VERSION}"
+          # The hosted runner user cannot write to /usr/local/bin, so install
+          # into a user-owned npm prefix and add its bin directory to PATH.
+          NPM_PREFIX="$RUNNER_TEMP/npm-global"
+          npm install --global --prefix "$NPM_PREFIX" "opencode-ai@${OPENCODE_VERSION}"
+          echo "$NPM_PREFIX/bin" >> "$GITHUB_PATH"
+          export PATH="$NPM_PREFIX/bin:$PATH"
           opencode --version
 
       - name: Create isolated GDScript test project
