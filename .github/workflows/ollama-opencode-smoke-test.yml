@@ -102,14 +102,21 @@ jobs:
           url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
           with urllib.request.urlopen(url, timeout=60) as r:
               entries = json.load(r)
-          quant = os.environ["MODEL_QUANT_PATTERN"].upper()
-          cands = [e for e in entries
+          ggufs = [e for e in entries
                    if e.get("type") == "file"
                    and e["path"].lower().endswith(".gguf")
-                   and quant in e["path"].upper()
                    and "mmproj" not in e["path"].lower()]
+          print("GGUF files available in", repo + ":")
+          for e in ggufs:
+              print("  ", e["path"], e.get("size"))
+          # Prefer the requested quant; fall back to other 4-bit K/0 quants.
+          cands = []
+          for quant in [os.environ["MODEL_QUANT_PATTERN"].upper(), "Q4_K_S", "Q4_0"]:
+              cands = [e for e in ggufs if quant in e["path"].upper()]
+              if cands:
+                  break
           if len(cands) != 1:
-              print("Expected exactly one matching GGUF, found:", [c["path"] for c in cands], file=sys.stderr)
+              print("Could not pick exactly one 4-bit GGUF; see the list above.", file=sys.stderr)
               sys.exit(1)
           e = cands[0]
           lfs = e.get("lfs") or {}
